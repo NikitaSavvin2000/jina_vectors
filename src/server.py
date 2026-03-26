@@ -13,7 +13,7 @@ from src.config import logger, public_or_local
 url = "http://localhost" if public_or_local == "LOCAL" else "http://11.11.11.11"
 origins = [url]
 
-app = FastAPI(docs_url="/jina/docs", openapi_url="/jina/openapi.json")
+app = FastAPI(docs_url="/docs", openapi_url="/jina/openapi.json")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -23,6 +23,11 @@ app.add_middleware(
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("="*50)
+print(f"        DEVICE     {device} ")
+print("="*50)
+
 tokenizer = AutoTokenizer.from_pretrained("jinaai/jina-embeddings-v5-text-small", trust_remote_code=True)
 model = AutoModel.from_pretrained("jinaai/jina-embeddings-v5-text-small", trust_remote_code=True).to(device)
 model = model.float()
@@ -30,41 +35,54 @@ model.eval()
 
 BATCH_SIZE = 128
 
-class EmbeddingRequest(BaseModel):
-    sentences: list[str]
+class SentenceItem(BaseModel):
+    id: int
+    text: str
+
+class BatchRequest(BaseModel):
+    batch: list[SentenceItem]
 
 def encode_batch(sentences: list[str], normalize: bool = True):
-    inputs = tokenizer(sentences, padding=True, truncation=True, return_tensors="pt").to(device).float()
+    inputs = tokenizer(sentences, padding=True, truncation=True, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
-        # для CPU и Mac используем pooler_output если last_hidden_state отсутствует
-        vectors = getattr(outputs, "last_hidden_state", None)
-        if vectors is None:
-            vectors = getattr(outputs, "pooler_output", None)
-        if vectors is None:
-            raise AttributeError("Model output has no last_hidden_state or pooler_output")
-        if len(vectors.shape) == 3:  # если вернулось [batch, seq, dim]
-            vectors = vectors[:, 0, :]  # [CLS]-токен
+        if hasattr(outputs, "embeddings"):
+            vectors = outputs.embeddings
+        elif hasattr(outputs, "last_hidden_state"):
+            vectors = outputs.last_hidden_state[:, 0, :]
+        elif hasattr(outputs, "pooler_output"):
+            vectors = outputs.pooler_output
+        else:
+            raise AttributeError("Model output has no embeddings / last_hidden_state / pooler_output")
         if normalize:
             vectors = torch.nn.functional.normalize(vectors, p=2, dim=1)
     return vectors.cpu().numpy().tolist()
 
 @app.post("/jina/embeddings")
 async def get_embeddings(
-        body: Annotated[EmbeddingRequest, Body(example={"sentences": ["Привет", "Как дела?", "Сегодня хорошая погода"]})],
-        normalize: bool = True
+        body: Annotated[BatchRequest, Body(example={
+            "batch": [
+                {"id": 0, "text": "Привет"},
+                {"id": 1, "text": "Как дела?"}
+            ]
+        })],
 ):
+
+    normalize = True
     try:
-        sentences = body.sentences
-        if not sentences:
+        if not body.batch:
             raise HTTPException(status_code=400, detail="No sentences provided")
+        ids = [item.id for item in body.batch]
+        sentences = [item.text for item in body.batch]
+
         results = []
         for i in range(0, len(sentences), BATCH_SIZE):
-            batch = sentences[i:i+BATCH_SIZE]
-            vectors = encode_batch(batch, normalize)
-            results.extend([{"sentence": s, "vector": v} for s, v in zip(batch, vectors)])
-        df = pd.DataFrame(results)
-        return df.to_dict(orient="records")
+            batch_sentences = sentences[i:i+BATCH_SIZE]
+            batch_ids = ids[i:i+BATCH_SIZE]
+            vectors = encode_batch(batch_sentences, normalize)
+            results.extend([{"id": id_, "vector": v} for id_, v in zip(batch_ids, vectors)])
+
+        return {"predictions": results}
     except Exception as e:
         logger.error(e.__repr__())
         raise HTTPException(status_code=500, detail=f"Unknown error: {e}")
