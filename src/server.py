@@ -1,24 +1,19 @@
-from typing import Annotated, List
-
-# import pandas as pd
+import os
+from typing import Annotated
+import pandas as pd
 import uvicorn
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import torch
+from transformers import AutoTokenizer, AutoModel
 
 from src.config import logger, public_or_local
-from src.models.schemes import HellowRequest
-from src.utils.greeting import hellow_names
 
-if public_or_local == 'LOCAL':
-    url = 'http://localhost'
-else:
-    url = 'http://11.11.11.11'
+url = "http://localhost" if public_or_local == "LOCAL" else "http://11.11.11.11"
+origins = [url]
 
-origins = [
-    url
-]
-
-app = FastAPI(docs_url="/template_fast_api/v1/", openapi_url='/template_fast_api/v1/openapi.json')
+app = FastAPI(docs_url="/jina/docs", openapi_url="/jina/openapi.json")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -27,38 +22,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = AutoTokenizer.from_pretrained("jinaai/jina-embeddings-v5-text-small", trust_remote_code=True)
+model = AutoModel.from_pretrained("jinaai/jina-embeddings-v5-text-small", trust_remote_code=True).to(device)
+model = model.float()
+model.eval()
 
+BATCH_SIZE = 128
 
-@app.post("/template_fast_api/v1/greetings")
-async def inputation(body: Annotated[
-    HellowRequest, Body(
-        example={"names": ['Sasha', 'Nikita', 'Kristina']})]):
+class EmbeddingRequest(BaseModel):
+    sentences: list[str]
+
+def encode_batch(sentences: list[str], normalize: bool = True):
+    inputs = tokenizer(sentences, padding=True, truncation=True, return_tensors="pt").to(device).float()
+    with torch.no_grad():
+        outputs = model(**inputs)
+        # для CPU и Mac используем pooler_output если last_hidden_state отсутствует
+        vectors = getattr(outputs, "last_hidden_state", None)
+        if vectors is None:
+            vectors = getattr(outputs, "pooler_output", None)
+        if vectors is None:
+            raise AttributeError("Model output has no last_hidden_state or pooler_output")
+        if len(vectors.shape) == 3:  # если вернулось [batch, seq, dim]
+            vectors = vectors[:, 0, :]  # [CLS]-токен
+        if normalize:
+            vectors = torch.nn.functional.normalize(vectors, p=2, dim=1)
+    return vectors.cpu().numpy().tolist()
+
+@app.post("/jina/embeddings")
+async def get_embeddings(
+        body: Annotated[EmbeddingRequest, Body(example={"sentences": ["Привет", "Как дела?", "Сегодня хорошая погода"]})],
+        normalize: bool = True
+):
     try:
-        names = body.names
-        if names:
-            res = hellow_names(names)
-            return res
-        else:
-            logger.error("Something happened during creation of the search table")
-            raise HTTPException(
-                status_code=400,
-                detail="Bad Request",
-                headers={"X-Error": "Something happened during creation of the search table"},
-            )
-    except Exception as ApplicationError:
-        logger.error(ApplicationError.__repr__())
-        raise HTTPException(
-            status_code=400,
-            detail="Unknown Error",
-            headers={"X-Error": f"{ApplicationError.__repr__()}"},
-        )
-
+        sentences = body.sentences
+        if not sentences:
+            raise HTTPException(status_code=400, detail="No sentences provided")
+        results = []
+        for i in range(0, len(sentences), BATCH_SIZE):
+            batch = sentences[i:i+BATCH_SIZE]
+            vectors = encode_batch(batch, normalize)
+            results.extend([{"sentence": s, "vector": v} for s, v in zip(batch, vectors)])
+        df = pd.DataFrame(results)
+        return df.to_dict(orient="records")
+    except Exception as e:
+        logger.error(e.__repr__())
+        raise HTTPException(status_code=500, detail=f"Unknown error: {e}")
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the indicators System API"}
-
+    return {"message": "Welcome to the Jina V5 embeddings API"}
 
 if __name__ == "__main__":
-    port = 7070
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=7091)
