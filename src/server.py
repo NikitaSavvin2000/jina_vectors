@@ -55,7 +55,12 @@ def encode_batch(sentences: list[str], normalize: bool = True):
 
     with torch.no_grad():
         outputs = model(**inputs)
-        vectors = outputs.embeddings.to(torch.float32)
+        last_hidden = outputs.last_hidden_state
+        attention_mask = inputs["attention_mask"].unsqueeze(-1)
+
+        vectors = (last_hidden * attention_mask).sum(dim=1) / attention_mask.sum(dim=1)
+        vectors = vectors.to(torch.float32)
+
         if normalize:
             vectors = torch.nn.functional.normalize(vectors, p=2, dim=1)
 
