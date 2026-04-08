@@ -43,19 +43,22 @@ class BatchRequest(BaseModel):
     batch: list[SentenceItem]
 
 def encode_batch(sentences: list[str], normalize: bool = True):
-    inputs = tokenizer(sentences, padding=True, truncation=True, return_tensors="pt").to(device)
+    if not sentences:
+        return []
+
+    inputs = tokenizer(
+        sentences,
+        padding=True,
+        truncation=True,
+        return_tensors="pt"
+    ).to(device)
+
     with torch.no_grad():
         outputs = model(**inputs)
-        if hasattr(outputs, "embeddings"):
-            vectors = outputs.embeddings
-        elif hasattr(outputs, "last_hidden_state"):
-            vectors = outputs.last_hidden_state[:, 0, :]
-        elif hasattr(outputs, "pooler_output"):
-            vectors = outputs.pooler_output
-        else:
-            raise AttributeError("Model output has no embeddings / last_hidden_state / pooler_output")
+        vectors = outputs.embeddings.to(torch.float32)
         if normalize:
             vectors = torch.nn.functional.normalize(vectors, p=2, dim=1)
+
     return vectors.cpu().numpy().tolist()
 
 @app.post("/jina/embeddings")
